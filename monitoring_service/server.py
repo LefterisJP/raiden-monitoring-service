@@ -2,17 +2,16 @@ from monitoring_service.transport import Transport
 import logging
 import gevent
 import random
-import time
 import sys
 import traceback
+from eth_utils import is_address
 
 from monitoring_service.blockchain import BlockchainMonitor
 from monitoring_service.state_db import StateDB
 from monitoring_service.messages import Message, BalanceProof
+from monitoring_service.tasks import StoreBalanceProof
 from monitoring_service.constants import (
     EVENT_CHANNEL_CLOSE,
-    EVENT_CHANNEL_CREATE,
-    MAX_BALANCE_PROOF_AGE
 )
 from monitoring_service.gevent_error_handler import register_error_handler
 
@@ -56,7 +55,7 @@ class MonitoringService(gevent.Greenlet):
         self.transport = transport
         self.blockchain = blockchain
         self.state_db = state_db
-        self.is_running = gevent.event.Event()
+        self.stop_event = gevent.event.Event()
         assert is_checksum_address(privkey_to_addr(self.private_key))
         self.transport.add_message_callback(lambda message: self.on_message_event(message))
         self.transport.privkey = lambda: self.private_key
@@ -65,6 +64,7 @@ class MonitoringService(gevent.Greenlet):
             contract_address = '0xD5BE9a680AbbF01aB2d422035A64DB27ab01C624'
             receiver = privkey_to_addr(private_key)
             state_db.setup_db(network_id, contract_address, receiver)
+        self.task_list = []  # list of greenlets spawned by this class
 
     def _run(self):
         register_error_handler(error_handler)
@@ -72,26 +72,33 @@ class MonitoringService(gevent.Greenlet):
         self.blockchain.start()
         self.blockchain.register_handler(
             EVENT_CHANNEL_CLOSE,
-            lambda channel: self.on_channel_close(channel)
-        )
-        self.blockchain.register_handler(
-            EVENT_CHANNEL_CREATE,
-            lambda channel: self.on_channel_create(channel)
+            lambda event, tx: self.on_channel_close(event, tx)
         )
 
-        self.is_running.wait()
+        # this loop will wait until spawned greenlets complete
+        while self.stop_event.is_set() is False:
+            tasks = gevent.wait(self.task_list, timeout=5, count=1)
+            if len(tasks) == 0:
+                gevent.sleep(5)
+                continue
+            task = tasks[0]
+            self.task_list.remove(task)
 
     def stop(self):
-        self.is_running.set()
+        self.stop_event.set()
 
-    def on_channel_close(self, event):
+    def on_channel_close(self, event, tx):
+        # this logic is still flawed - we must also handle settling and channel update events
         log.info('on channel close: %s' % str(event))
-        event = event['data']
         # check if we have balance proof for the closing
-        if event['channel_address'] not in self.state_db.balance_proofs:
+        closing_address = event['args']['closing_address']
+        channel_address = event['address']
+        assert is_address(closing_address)
+        assert is_address(channel_address)
+        if channel_address not in self.state_db.balance_proofs:
             return
-        balance_proof = self.state_db.balance_proofs[event['channel_address']]
-        if self.check_event_data(balance_proof, event) is False:
+        balance_proof = self.state_db.balance_proofs[channel_address]
+        if closing_address not in (balance_proof['participant1'], balance_proof['participant2']):
             log.warning('Event data do not match balance proof data! event=%s, bp=%s'
                         % (event, balance_proof))
             return
@@ -99,29 +106,18 @@ class MonitoringService(gevent.Greenlet):
         # check if we should challenge closeChannel
         if self.check_event(event) is False:
             log.warning('Invalid balance proof submitted! Challenging! event=%s' % event)
-            self.challenge_proof(event)
+            self.challenge_proof(channel_address)
 
-    def check_event_data(self, balance_proof: dict, event: dict):
-        participant1_bp, participant2_bp = order_participants(
-            balance_proof.participant1,
-            balance_proof.participant2
-        )
-        participant1_event, participant2_event = order_participants(
-            event['participant1'],
-            event['participant2']
-        )
-        return ((participant1_bp == participant1_event) and
-                (participant2_bp == participant2_event) and
-                (balance_proof.channel_address == event['channel_address']))
+        self.state_db.delete_balance_proof(channel_address)
 
     def check_event(self, event):
         return random.random() < 0.3
 
-    def challenge_proof(self, balance_proof_msg: BalanceProof):
+    def challenge_proof(self, channel_address):
         balance_proof = self.state_db.balance_proofs.get(
-            balance_proof_msg['channel_address'], None
+            channel_address, None
         )
-        log.info('challenging proof event=%s BP=%s' % (balance_proof_msg, balance_proof))
+        log.info('challenging proof channel=%s BP=%s' % (channel_address, balance_proof))
 
     def on_message_event(self, message):
         """This handles messages received over the Transport"""
@@ -130,26 +126,21 @@ class MonitoringService(gevent.Greenlet):
             self.on_balance_proof(message)
 
     def on_balance_proof(self, balance_proof):
-        """Called whenever a balance proof message is received"""
+        """Called whenever a balance proof message is received.
+        This will spawn a greenlet and store its reference in an internal list.
+        Return value of the greenlet is then checked in the main loop."""
         assert isinstance(balance_proof, BalanceProof)
-        existing_bp = self.state_db.balance_proofs.get(balance_proof.channel_address, None)
-        if existing_bp is not None:
-            if existing_bp['timestamp'] > balance_proof.timestamp:
-                log.warning('attempt to update with an older BP: stored=%s, received=%s' %
-                            (existing_bp, balance_proof))
-                return
-        bp_age = time.time() - balance_proof.timestamp
-        if bp_age > MAX_BALANCE_PROOF_AGE:
-            log.info('Not accepting BP: too old. diff=%d bp=%s' % (bp_age, balance_proof))
-            return
-
-        if bp_age < 0:
-            log.info('Not accepting BP: time mismatch. bp=%s' % balance_proof)
-            return
-
-        log.info('received balance proof: %s' % str(balance_proof))
-        self.state_db.store_balance_proof(balance_proof.serialize_data())
+        task = StoreBalanceProof(self.blockchain.web3, self.state_db, balance_proof)
+        task.start()
+        self.task_list.append(task)
 
     @property
     def balance_proofs(self):
         return self.state_db.balance_proofs
+
+    def wait_tasks(self):
+        """Wait until all internal tasks are finished"""
+        while True:
+            if len(self.task_list) == 0:
+                return
+            gevent.sleep(1)
